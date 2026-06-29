@@ -166,6 +166,61 @@ def _build_slot_mapping(
     return slots[:num_tokens]
 
 
+def _dsa_decode_window_tokens() -> int:
+    try:
+        return max(
+            0,
+            int(os.environ.get("VLLM_ASCEND_DSA_DECODE_WINDOW_TOKENS", "1024")),
+        )
+    except ValueError:
+        return 1024
+
+
+def _dsa_decode_lmcache_len(prompt_len: int, input_token_len: int) -> int:
+    window_tokens = _dsa_decode_window_tokens()
+    decoded_tokens = max(0, input_token_len - prompt_len)
+    if window_tokens <= 0 or decoded_tokens <= 0:
+        return prompt_len
+    return prompt_len + ((decoded_tokens - 1) // window_tokens) * window_tokens
+
+
+def _dsa_decode_window_should_save(prompt_len: int, input_token_len: int) -> bool:
+    window_tokens = _dsa_decode_window_tokens()
+    decoded_tokens = input_token_len - prompt_len
+    return window_tokens > 0 and decoded_tokens > 0 and decoded_tokens % window_tokens == 0
+
+
+def _build_dsa_decode_window_slot_mapping(
+    block_ids: list[int],
+    block_size: int,
+    num_tokens: int,
+    prompt_len: int,
+) -> torch.Tensor:
+    if num_tokens <= 0:
+        return torch.empty(0, dtype=torch.long)
+    window_tokens = _dsa_decode_window_tokens()
+    if window_tokens <= 0 or num_tokens <= prompt_len:
+        return _build_slot_mapping(block_ids, block_size, num_tokens)
+
+    positions = torch.arange(num_tokens, dtype=torch.long)
+    logical_positions = positions.clone()
+    decode_mask = positions >= int(prompt_len)
+    logical_positions[decode_mask] = int(prompt_len) + torch.remainder(
+        positions[decode_mask] - int(prompt_len),
+        int(window_tokens),
+    )
+    logical_blocks = torch.div(logical_positions, block_size, rounding_mode="floor")
+    offsets = torch.remainder(logical_positions, block_size)
+    if block_ids:
+        max_block_index = len(block_ids) - 1
+        logical_blocks = torch.clamp(logical_blocks, min=0, max=max_block_index)
+        block_ids_t = torch.tensor(block_ids, dtype=torch.long)
+        physical_blocks = block_ids_t.index_select(0, logical_blocks)
+    else:
+        physical_blocks = torch.zeros_like(logical_blocks)
+    return physical_blocks * block_size + offsets
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -498,11 +553,23 @@ class ReqMeta:
         # NOTE(vladnosiv): for disagg, you cannot skip saving, as saving is a transfer
         # Check if request_configs has lmcache.skip_save set to True
         request_skip = (tracker.request_configs or {}).get("lmcache.skip_save", False)
+        force_decode_window_save = is_sparse_decode and _dsa_decode_window_should_save(
+            tracker.prompt_len,
+            input_token_len,
+        )
 
         skip_save = tracker.disagg_spec is None and (
             tracker.skip_save
-            or (tracker.num_saved_tokens > 0 and input_token_len < chunk_boundary)
-            or (tracker.is_decode_phase and not save_decode_cache)
+            or (
+                not force_decode_window_save
+                and tracker.num_saved_tokens > 0
+                and input_token_len < chunk_boundary
+            )
+            or (
+                tracker.is_decode_phase
+                and not save_decode_cache
+                and not force_decode_window_save
+            )
             or request_skip
         )
 
@@ -515,7 +582,9 @@ class ReqMeta:
         # NOTE(vladnosiv): for the input_token_len chunk prefill,
         # we are required to discard partial chunks,
         # as new tokens will be added in the next iteration.
-        if not is_last_prefill or discard_partial_chunks:
+        if force_decode_window_save:
+            num_tokens_to_save = input_token_len
+        elif not is_last_prefill or discard_partial_chunks:
             num_tokens_to_save = (
                 input_token_len // lmcache_chunk_size * lmcache_chunk_size
             )
@@ -529,7 +598,10 @@ class ReqMeta:
 
         # Calculate the token ids and slot mappings for load and save
         if is_sparse_decode and load_spec is not None and skip_save:
-            if not tracker.sparse_token_ids:
+            if (
+                not tracker.sparse_token_ids
+                or len(tracker.sparse_token_ids) != load_spec.lmcache_cached_tokens
+            ):
                 tracker.sparse_token_ids = input_token_ids[
                     : load_spec.lmcache_cached_tokens
                 ]
@@ -560,7 +632,7 @@ class ReqMeta:
 
         num_blocks = len(tracker.allocated_block_ids)
 
-        if len(token_ids) > num_blocks * block_size:
+        if len(token_ids) > num_blocks * block_size and not is_sparse_decode:
             logger.error(
                 "The number of tokens is more than the number of blocks"
                 " for request %s. "
@@ -574,15 +646,28 @@ class ReqMeta:
                 block_size,
             )
 
-        if is_sparse_decode and load_spec is not None:
-            if not tracker.sparse_slot_mapping:
-                num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
+        if is_sparse_decode and load_spec is not None and skip_save:
+            num_slots = _sparse_slot_mapping_len(load_spec.lmcache_cached_tokens)
+            if (
+                not tracker.sparse_slot_mapping
+                or int(tracker.sparse_slot_mapping[0].numel()) != num_slots
+            ):
+                tracker.sparse_slot_mapping.clear()
                 tracker.sparse_slot_mapping.append(
                     _build_slot_mapping(
                         tracker.allocated_block_ids, block_size, num_slots
                     )
                 )
             slot_mapping = tracker.sparse_slot_mapping
+        elif is_sparse_decode and not skip_save:
+            slot_mapping = [
+                _build_dsa_decode_window_slot_mapping(
+                    tracker.allocated_block_ids,
+                    block_size,
+                    len(token_ids),
+                    tracker.prompt_len,
+                )
+            ]
         else:
             slot_mapping = [
                 _build_slot_mapping(
@@ -983,8 +1068,10 @@ class LMCacheConnectorV1Impl:
     def _load_tokens_for_retrieve(
         tokens: list[int], lmcache_cached_tokens: int, *, is_sparse_decode: bool
     ) -> list[int]:
-        """Return token ids for retrieve without redundant list copy on decode."""
-        if is_sparse_decode or lmcache_cached_tokens >= len(tokens):
+        """Return token ids that can be retrieved from LMCache."""
+        if is_sparse_decode:
+            return tokens[:lmcache_cached_tokens]
+        if lmcache_cached_tokens >= len(tokens):
             return tokens
         return tokens[:lmcache_cached_tokens]
 
@@ -1736,11 +1823,12 @@ class LMCacheConnectorV1Impl:
                     if skip_leading_tokens == len(token_ids):
                         continue  # skip this request
                     # Align to lmcache chunk size
-                    skip_leading_tokens = (
-                        skip_leading_tokens
-                        // self._lmcache_chunk_size
-                        * self._lmcache_chunk_size
-                    )
+                    if not request.is_sparse_decode:
+                        skip_leading_tokens = (
+                            skip_leading_tokens
+                            // self._lmcache_chunk_size
+                            * self._lmcache_chunk_size
+                        )
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
@@ -1845,11 +1933,12 @@ class LMCacheConnectorV1Impl:
             if skip_leading_tokens == len(token_ids):
                 continue  # skip this request
             # Align to lmcache chunk size
-            skip_leading_tokens = (
-                skip_leading_tokens
-                // self._lmcache_chunk_size
-                * self._lmcache_chunk_size
-            )
+            if not request.is_sparse_decode:
+                skip_leading_tokens = (
+                    skip_leading_tokens
+                    // self._lmcache_chunk_size
+                    * self._lmcache_chunk_size
+                )
 
             store_mask = torch.ones(len(token_ids), dtype=torch.bool)
             store_mask[:skip_leading_tokens] = False
@@ -2354,7 +2443,18 @@ class LMCacheConnectorV1Impl:
 
             is_sparse_decode = self.enable_sparse_attention and (request.num_computed_tokens > request.num_prompt_tokens)
             if is_sparse_decode:
-                load_spec = LoadSpec(vllm_cached_tokens=0, lmcache_cached_tokens=len(request.prompt_token_ids), can_load=True)
+                lmcache_cached_tokens = _dsa_decode_lmcache_len(
+                    request.num_prompt_tokens,
+                    len(request_tracker.token_ids),
+                )
+                load_spec = LoadSpec(
+                    vllm_cached_tokens=0,
+                    lmcache_cached_tokens=min(
+                        lmcache_cached_tokens,
+                        len(request_tracker.token_ids),
+                    ),
+                    can_load=True,
+                )
 
             req_meta = ReqMeta.from_request_tracker(
                 request_tracker,
