@@ -80,6 +80,7 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
         selected_tokens: list = None,
         token_start_index: list = None,
         request_ids=None,
+        target_slot_mapping: list = None,
     ) -> None:
         """
         Block until the KV for a specific layer is loaded into vLLM's
@@ -94,9 +95,14 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             token_start_index: per-request start offset into slot_mapping.
             request_ids: req_id for each selected_tokens row (input_batch order),
                 used to pair rows to requests by identity instead of by position.
+            target_slot_mapping: explicit target slots for selected_tokens.
         """
         self._lmcache_engine.wait_for_layer_load(
-            layer_name, selected_tokens, token_start_index, request_ids
+            layer_name,
+            selected_tokens,
+            token_start_index,
+            request_ids,
+            target_slot_mapping=target_slot_mapping,
         )
 
     def save_kv_layer(

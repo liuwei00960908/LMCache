@@ -1599,6 +1599,7 @@ class LMCacheConnectorV1Impl:
         selected_tokens: list = None,
         token_start_index: list = None,
         request_ids: list = None,
+        target_slot_mapping: list = None,
     ) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
         paged buffer.
@@ -1607,9 +1608,10 @@ class LMCacheConnectorV1Impl:
 
         Args:
             layer_name: the name of that layer
-            selected_tokens: batched sparse token indices per decode request.
-            token_start_index: per-request start offset into slot_mapping.
-            request_ids: req_id for each selected_tokens row (input_batch order).
+            selected_tokens: sparse token indices per decode row.
+            token_start_index: legacy per-row start offset into slot_mapping.
+            request_ids: req_id for each selected_tokens row (duplicates allowed).
+            target_slot_mapping: explicit target slots per selected token row.
         """
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
@@ -1619,11 +1621,34 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
-        row_of_req = (
-            {rid: row for row, rid in enumerate(request_ids)}
-            if request_ids is not None
-            else None
-        )
+        rows_of_req = None
+        if request_ids is not None:
+            rows_of_req = {}
+            for row, rid in enumerate(request_ids):
+                rows_of_req.setdefault(rid, []).append(row)
+
+        def _rows(value: Any, rows: list[int]):
+            if hasattr(value, "__getitem__"):
+                if isinstance(value, torch.Tensor):
+                    return value[rows]
+                return [value[row] for row in rows]
+            raise TypeError(f"Unsupported row-indexed value type: {type(value)!r}")
+
+        def _flatten(value: Any):
+            if isinstance(value, torch.Tensor):
+                return value.reshape(-1)
+            if isinstance(value, list):
+                out = []
+                for item in value:
+                    if isinstance(item, torch.Tensor):
+                        out.extend(item.reshape(-1).tolist())
+                    elif isinstance(item, list):
+                        out.extend(item)
+                    else:
+                        out.append(item)
+                return out
+            return value
+
         trace_wait = _dsa_debug_should_log(self, "wait_sparse_decode")
         if trace_wait:
             sparse_reqs = [
@@ -1635,7 +1660,8 @@ class LMCacheConnectorV1Impl:
                 "current_layer=%s retrievers=%s metadata_reqs=%s "
                 "sparse_reqs=%s selected_shape=%s selected_sample=%s "
                 "selected_minmax_count=%s token_start_index=%s "
-                "request_ids=%s row_of_req=%s",
+                "request_ids=%s rows_of_req=%s target_slot_shape=%s "
+                "target_slot_sample=%s target_slot_minmax_count=%s",
                 layer_name,
                 self.current_layer,
                 len(self.layerwise_retrievers),
@@ -1646,8 +1672,11 @@ class LMCacheConnectorV1Impl:
                 _dsa_debug_minmax_count(selected_tokens),
                 _dsa_debug_sample(token_start_index),
                 _dsa_debug_sample(request_ids),
-                dict(list(row_of_req.items())[:_dsa_debug_limit()])
-                if row_of_req is not None else None,
+                dict(list(rows_of_req.items())[:_dsa_debug_limit()])
+                if rows_of_req is not None else None,
+                _dsa_debug_shape(target_slot_mapping),
+                _dsa_debug_sample(target_slot_mapping),
+                _dsa_debug_minmax_count(target_slot_mapping),
             )
 
         idx = 0
@@ -1666,21 +1695,23 @@ class LMCacheConnectorV1Impl:
                 break
             layerwise_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
+                payload = None
+                rows = None
                 if selected_tokens is None:
                     selected_tokens_per_req = None
                     token_start_index_per_req = 0
                 else:
-                    if row_of_req is not None and request.req_id not in row_of_req:
+                    if rows_of_req is not None and request.req_id not in rows_of_req:
                         raise RuntimeError(
                             "[DSA_SHRINK_CHECK] lmcache_wait_row_missing "
                             f"layer={layer_name} req={request.req_id} "
                             f"request_ids={_dsa_debug_sample(request_ids)} "
                             f"sparse_decode_row={decode_row}"
                         )
-                    row = (
-                        row_of_req[request.req_id]
-                        if row_of_req is not None
-                        else decode_row
+                    rows = (
+                        rows_of_req[request.req_id]
+                        if rows_of_req is not None
+                        else [decode_row]
                     )
                     selected_rows = (
                         int(selected_tokens.shape[0])
@@ -1688,23 +1719,35 @@ class LMCacheConnectorV1Impl:
                         and len(selected_tokens.shape) > 0
                         else len(selected_tokens)
                     )
-                    if row >= selected_rows:
+                    if max(rows) >= selected_rows:
                         raise RuntimeError(
                             "[DSA_SHRINK_CHECK] lmcache_wait_row_oob "
                             f"layer={layer_name} req={request.req_id} "
-                            f"row={row} selected_rows={selected_rows} "
+                            f"rows={rows} selected_rows={selected_rows} "
                             f"request_ids={_dsa_debug_sample(request_ids)}"
                         )
-                    selected_tokens_per_req = selected_tokens[row]
-                    token_start_index_per_req = (
-                        0 if token_start_index is None else token_start_index[row]
-                    )
+                    selected_tokens_per_req = _rows(selected_tokens, rows)
+                    if target_slot_mapping is not None:
+                        target_slot_mapping_per_req = _rows(target_slot_mapping, rows)
+                        payload = {
+                            "selected_token_ids": _flatten(selected_tokens_per_req),
+                            "target_slot_mapping": _flatten(target_slot_mapping_per_req),
+                        }
+                        token_start_index_per_req = None
+                    else:
+                        token_start_index_per_req = (
+                            0
+                            if token_start_index is None
+                            else _rows(token_start_index, rows)
+                        )
                 if trace_wait:
                     logger.warning(
                         "[DSA_SHRINK_CHECK] lmcache_wait_send_sparse "
-                        "layer=%s req=%s idx=%s decode_row=%s row=%s "
+                        "layer=%s req=%s idx=%s decode_row=%s rows=%s "
                         "selected_shape=%s selected_sample=%s "
                         "selected_minmax_count=%s token_start_index=%s "
+                        "target_slot_shape=%s target_slot_sample=%s "
+                        "target_slot_minmax_count=%s "
                         "slot_mapping_shape=%s slot_mapping_sample=%s "
                         "slot_mapping_minmax_count=%s vllm_cached=%s "
                         "lmcache_cached=%s",
@@ -1712,11 +1755,23 @@ class LMCacheConnectorV1Impl:
                         request.req_id,
                         idx,
                         decode_row,
-                        None if selected_tokens is None else row,
+                        rows,
                         _dsa_debug_shape(selected_tokens_per_req),
                         _dsa_debug_sample(selected_tokens_per_req),
                         _dsa_debug_minmax_count(selected_tokens_per_req),
                         token_start_index_per_req,
+                        _dsa_debug_shape(
+                            payload.get("target_slot_mapping")
+                            if payload is not None else None
+                        ),
+                        _dsa_debug_sample(
+                            payload.get("target_slot_mapping")
+                            if payload is not None else None
+                        ),
+                        _dsa_debug_minmax_count(
+                            payload.get("target_slot_mapping")
+                            if payload is not None else None
+                        ),
                         _dsa_debug_shape(
                             request.slot_mapping[0] if request.slot_mapping else None
                         ),
@@ -1730,9 +1785,11 @@ class LMCacheConnectorV1Impl:
                         request.load_spec.lmcache_cached_tokens,
                     )
                 ret_token_mask = layerwise_retriever.send(
-                    (selected_tokens_per_req, token_start_index_per_req)
+                    payload
+                    if payload is not None
+                    else (selected_tokens_per_req, token_start_index_per_req)
                 )
-                decode_row += 1
+                decode_row += len(rows) if rows is not None else 1
             else:
                 ret_token_mask = next(layerwise_retriever)
 
