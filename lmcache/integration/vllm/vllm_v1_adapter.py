@@ -1103,12 +1103,61 @@ class LMCacheConnectorV1Impl:
 
     def _drain_layerwise_retrievers(self) -> None:
         """Finish suspended layerwise generators to avoid GC cost on reset."""
-        for retriever in self.layerwise_retrievers:
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_LOAD_DBG] lmcache_drain_retrievers enter step=%s "
+                "current_layer=%s num_layers=%s retrievers=%s",
+                getattr(self, "_dsa_forward_step", None),
+                getattr(self, "current_layer", None),
+                getattr(self, "num_layers", None),
+                len(self.layerwise_retrievers),
+            )
+        for idx, retriever in enumerate(self.layerwise_retrievers):
             try:
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_LOAD_DBG] lmcache_drain_retrievers next step=%s "
+                        "idx=%s current_layer=%s num_layers=%s retrievers=%s",
+                        getattr(self, "_dsa_forward_step", None),
+                        idx,
+                        getattr(self, "current_layer", None),
+                        getattr(self, "num_layers", None),
+                        len(self.layerwise_retrievers),
+                    )
                 next(retriever)
             except StopIteration:
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_LOAD_DBG] lmcache_drain_retrievers stopped step=%s "
+                        "idx=%s current_layer=%s num_layers=%s",
+                        getattr(self, "_dsa_forward_step", None),
+                        idx,
+                        getattr(self, "current_layer", None),
+                        getattr(self, "num_layers", None),
+                    )
                 pass
+            except Exception:
+                if _dsa_debug_enabled():
+                    logger.exception(
+                        "[DSA_LOAD_DBG] lmcache_drain_retrievers exception step=%s "
+                        "idx=%s current_layer=%s num_layers=%s retrievers=%s",
+                        getattr(self, "_dsa_forward_step", None),
+                        idx,
+                        getattr(self, "current_layer", None),
+                        getattr(self, "num_layers", None),
+                        len(self.layerwise_retrievers),
+                    )
+                raise
         self.layerwise_retrievers.clear()
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_LOAD_DBG] lmcache_drain_retrievers cleared step=%s "
+                "current_layer=%s num_layers=%s retrievers=%s",
+                getattr(self, "_dsa_forward_step", None),
+                getattr(self, "current_layer", None),
+                getattr(self, "num_layers", None),
+                len(self.layerwise_retrievers),
+            )
 
     def _should_defer_lookup_unpin_for_sparse_decode(self, request: ReqMeta) -> bool:
         """Keep lookup pins across decode steps while sparse retrieve is active."""
@@ -1666,6 +1715,23 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_SHRINK_CHECK] lmcache_wait_layer_enter step=%s "
+                "layer=%s current_layer=%s num_layers=%s retrievers=%s "
+                "metadata_id=%s selected_shape=%s token_start_index=%s "
+                "request_ids=%s",
+                getattr(self, "_dsa_forward_step", None),
+                layer_name,
+                self.current_layer,
+                self.num_layers,
+                len(self.layerwise_retrievers),
+                id(metadata),
+                _dsa_debug_shape(selected_tokens),
+                _dsa_debug_sample(token_start_index),
+                _dsa_debug_sample(request_ids),
+            )
+
         row_of_req = (
             {rid: row for row, rid in enumerate(request_ids)}
             if request_ids is not None
@@ -1779,6 +1845,20 @@ class LMCacheConnectorV1Impl:
                 ret_token_mask = layerwise_retriever.send(
                     (selected_tokens_per_req, token_start_index_per_req)
                 )
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_SHRINK_CHECK] lmcache_wait_send_sparse_done step=%s "
+                        "layer=%s req=%s idx=%s current_layer=%s num_layers=%s "
+                        "retrievers=%s ret_mask_shape=%s",
+                        getattr(self, "_dsa_forward_step", None),
+                        layer_name,
+                        request.req_id,
+                        idx,
+                        self.current_layer,
+                        self.num_layers,
+                        len(self.layerwise_retrievers),
+                        _dsa_debug_shape(ret_token_mask),
+                    )
                 decode_row += 1
             else:
                 ret_token_mask = next(layerwise_retriever)
@@ -1790,8 +1870,38 @@ class LMCacheConnectorV1Impl:
             idx += 1
 
         if self.layerwise_retrievers:
+            if _dsa_debug_enabled():
+                logger.warning(
+                    "[DSA_SHRINK_CHECK] lmcache_wait_layer_advance step=%s "
+                    "layer=%s current_layer_before=%s num_layers=%s retrievers=%s",
+                    getattr(self, "_dsa_forward_step", None),
+                    layer_name,
+                    self.current_layer,
+                    self.num_layers,
+                    len(self.layerwise_retrievers),
+                )
             self.current_layer += 1
+            if _dsa_debug_enabled():
+                logger.warning(
+                    "[DSA_SHRINK_CHECK] lmcache_wait_layer_advanced step=%s "
+                    "layer=%s current_layer_after=%s num_layers=%s retrievers=%s",
+                    getattr(self, "_dsa_forward_step", None),
+                    layer_name,
+                    self.current_layer,
+                    self.num_layers,
+                    len(self.layerwise_retrievers),
+                )
             if self.current_layer >= self.num_layers:
+                if _dsa_debug_enabled():
+                    logger.warning(
+                        "[DSA_SHRINK_CHECK] lmcache_wait_layer_finalize step=%s "
+                        "layer=%s current_layer=%s num_layers=%s retrievers=%s",
+                        getattr(self, "_dsa_forward_step", None),
+                        layer_name,
+                        self.current_layer,
+                        self.num_layers,
+                        len(self.layerwise_retrievers),
+                    )
                 self._finalize_worker_retrieve_state_from_metadata(metadata)
                 self._drain_layerwise_retrievers()
 
