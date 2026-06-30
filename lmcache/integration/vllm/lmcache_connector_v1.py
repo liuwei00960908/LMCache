@@ -86,9 +86,15 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             attn_metadata = getattr(forward_context, "attn_metadata", None)
             logger.warning(
                 "[DSA_LOAD_DBG] lmcache_connector_wrapper start_load_enter "
-                "connector=%s attn_metadata=%s kwargs=%s",
+                "connector=%s connector_id=%s engine_id=%s metadata_id=%s "
+                "attn_metadata=%s attn_metadata_id=%s kwargs=%s",
                 self.__class__.__name__,
+                id(self),
+                id(self._lmcache_engine),
+                id(self._connector_metadata)
+                if self._connector_metadata is not None else None,
                 attn_metadata.__class__.__name__ if attn_metadata is not None else None,
+                id(attn_metadata) if attn_metadata is not None else None,
                 sorted(kwargs.keys()),
             )
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
@@ -143,6 +149,22 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_STORE_DBG] lmcache_connector_wrapper save_enter "
+                "layer=%s connector=%s connector_id=%s engine_id=%s "
+                "metadata_id=%s attn_metadata=%s attn_metadata_id=%s kwargs=%s",
+                layer_name,
+                self.__class__.__name__,
+                id(self),
+                id(self._lmcache_engine),
+                id(self._connector_metadata)
+                if self._connector_metadata is not None else None,
+                attn_metadata.__class__.__name__
+                if attn_metadata is not None else None,
+                id(attn_metadata) if attn_metadata is not None else None,
+                sorted(kwargs.keys()),
+            )
         self._lmcache_engine.save_kv_layer(
             layer_name, kv_layer, attn_metadata, **kwargs
         )

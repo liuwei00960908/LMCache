@@ -1269,6 +1269,7 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+        self._dsa_forward_step = getattr(self, "_dsa_forward_step", 0) + 1
 
         if len(self.kv_caches) == 0:
             logger.warning(
@@ -1316,11 +1317,20 @@ class LMCacheConnectorV1Impl:
                 )
             logger.warning(
                 "[DSA_LOAD_DBG] lmcache_start_load metadata_requests=%s "
-                "active_req_ids=%s attn_metadata=%s use_layerwise=%s "
-                "kv_caches=%s current_layer=%s requests=%s",
+                "step=%s impl_id=%s parent_id=%s metadata_id=%s "
+                "parent_metadata_id=%s active_req_ids=%s attn_metadata=%s "
+                "attn_metadata_id=%s use_layerwise=%s kv_caches=%s "
+                "current_layer=%s requests=%s",
                 len(metadata.requests),
+                self._dsa_forward_step,
+                id(self),
+                id(self._parent),
+                id(metadata),
+                id(self._parent._connector_metadata)
+                if self._parent._connector_metadata is not None else None,
                 sorted(active_req_ids),
                 attn_metadata.__class__.__name__ if attn_metadata is not None else None,
+                id(attn_metadata) if attn_metadata is not None else None,
                 self.use_layerwise,
                 len(self.kv_caches),
                 self.current_layer,
@@ -1840,8 +1850,17 @@ class LMCacheConnectorV1Impl:
                 )
             logger.warning(
                 "[DSA_STORE_DBG] lmcache_save_kv_layer enter layer=%s "
-                "kv_role=%s use_layerwise=%s requests=%s",
+                "step=%s impl_id=%s parent_id=%s metadata_id=%s "
+                "parent_metadata_id=%s attn_metadata_id=%s kv_role=%s "
+                "use_layerwise=%s requests=%s",
                 layer_name,
+                getattr(self, "_dsa_forward_step", None),
+                id(self),
+                id(self._parent),
+                id(connector_metadata),
+                id(self._parent._connector_metadata)
+                if self._parent._connector_metadata is not None else None,
+                id(attn_metadata) if attn_metadata is not None else None,
                 self.kv_role,
                 self.use_layerwise,
                 request_summaries,
@@ -1948,6 +1967,38 @@ class LMCacheConnectorV1Impl:
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+
+        if _dsa_debug_should_log(self, "wait_for_save"):
+            request_summaries = []
+            for request in connector_metadata.requests[: _dsa_debug_limit()]:
+                save_spec = request.save_spec
+                request_summaries.append(
+                    {
+                        "req_id": request.req_id,
+                        "sparse": request.is_sparse_decode,
+                        "token_ids": len(request.token_ids),
+                        "slot_mapping": _dsa_debug_shape(request.slot_mapping[0])
+                        if request.slot_mapping else None,
+                        "can_save": save_spec.can_save
+                        if save_spec is not None else None,
+                        "skip_leading": save_spec.skip_leading_tokens
+                        if save_spec is not None else None,
+                    }
+                )
+            logger.warning(
+                "[DSA_STORE_DBG] lmcache_wait_for_save enter step=%s "
+                "impl_id=%s parent_id=%s metadata_id=%s parent_metadata_id=%s "
+                "kv_role=%s use_layerwise=%s requests=%s",
+                getattr(self, "_dsa_forward_step", None),
+                id(self),
+                id(self._parent),
+                id(connector_metadata),
+                id(self._parent._connector_metadata)
+                if self._parent._connector_metadata is not None else None,
+                self.kv_role,
+                self.use_layerwise,
+                request_summaries,
+            )
 
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
