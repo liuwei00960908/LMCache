@@ -1116,7 +1116,7 @@ class LMCacheConnectorV1Impl:
             try:
                 if _dsa_debug_enabled():
                     logger.warning(
-                        "[DSA_LOAD_DBG] lmcache_drain_retrievers next step=%s "
+                        "[DSA_LOAD_DBG] lmcache_drain_retrievers drain step=%s "
                         "idx=%s current_layer=%s num_layers=%s retrievers=%s",
                         getattr(self, "_dsa_forward_step", None),
                         idx,
@@ -1124,7 +1124,10 @@ class LMCacheConnectorV1Impl:
                         getattr(self, "num_layers", None),
                         len(self.layerwise_retrievers),
                     )
-                next(retriever)
+                if self.current_layer < self.num_layers:
+                    retriever.close()
+                else:
+                    next(retriever)
             except StopIteration:
                 if _dsa_debug_enabled():
                     logger.warning(
@@ -2064,6 +2067,7 @@ class LMCacheConnectorV1Impl:
                     cached_ends=request.cached_ends,
                     cached_memory_objs=request.cached_memory_objs,
                     cached_tensors=request.cached_tensors,
+                    is_sparse_decode=request.is_sparse_decode,
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
