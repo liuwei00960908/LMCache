@@ -1289,6 +1289,43 @@ class LMCacheConnectorV1Impl:
         kvcaches = self._kvcaches_list
 
         attn_metadata = forward_context.attn_metadata
+        if _dsa_debug_should_log(self, "start_load_kv"):
+            request_summaries = []
+            for request in metadata.requests[: _dsa_debug_limit()]:
+                load_spec = request.load_spec
+                save_spec = request.save_spec
+                request_summaries.append(
+                    {
+                        "req_id": request.req_id,
+                        "sparse": request.is_sparse_decode,
+                        "token_ids": len(request.token_ids),
+                        "load": None
+                        if load_spec is None
+                        else {
+                            "can_load": load_spec.can_load,
+                            "vllm_cached": load_spec.vllm_cached_tokens,
+                            "lmcache_cached": load_spec.lmcache_cached_tokens,
+                        },
+                        "save": None
+                        if save_spec is None
+                        else {
+                            "can_save": save_spec.can_save,
+                            "skip_leading": save_spec.skip_leading_tokens,
+                        },
+                    }
+                )
+            logger.warning(
+                "[DSA_LOAD_DBG] lmcache_start_load metadata_requests=%s "
+                "active_req_ids=%s attn_metadata=%s use_layerwise=%s "
+                "kv_caches=%s current_layer=%s requests=%s",
+                len(metadata.requests),
+                sorted(active_req_ids),
+                attn_metadata.__class__.__name__ if attn_metadata is not None else None,
+                self.use_layerwise,
+                len(self.kv_caches),
+                self.current_layer,
+                request_summaries,
+            )
         if attn_metadata is None:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
             return
@@ -1784,6 +1821,32 @@ class LMCacheConnectorV1Impl:
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
+        if _dsa_debug_should_log(self, "save_kv_layer"):
+            request_summaries = []
+            for request in connector_metadata.requests[: _dsa_debug_limit()]:
+                save_spec = request.save_spec
+                request_summaries.append(
+                    {
+                        "req_id": request.req_id,
+                        "sparse": request.is_sparse_decode,
+                        "token_ids": len(request.token_ids),
+                        "slot_mapping": _dsa_debug_shape(request.slot_mapping[0])
+                        if request.slot_mapping else None,
+                        "can_save": save_spec.can_save
+                        if save_spec is not None else None,
+                        "skip_leading": save_spec.skip_leading_tokens
+                        if save_spec is not None else None,
+                    }
+                )
+            logger.warning(
+                "[DSA_STORE_DBG] lmcache_save_kv_layer enter layer=%s "
+                "kv_role=%s use_layerwise=%s requests=%s",
+                layer_name,
+                self.kv_role,
+                self.use_layerwise,
+                request_summaries,
+            )
+
         assert len(self.kv_caches) > 0
 
         kvcaches = list(self.kv_caches.values())
@@ -1832,6 +1895,21 @@ class LMCacheConnectorV1Impl:
 
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
+
+                if request.is_sparse_decode and _dsa_debug_should_log(
+                    self, "save_kv_layer_sparse_store"
+                ):
+                    logger.warning(
+                        "[DSA_STORE_DBG] lmcache_save_kv_layer sparse_store "
+                        "layer=%s req=%s token_ids=%s skip_leading=%s "
+                        "store_tokens=%s slot_mapping=%s",
+                        layer_name,
+                        request.req_id,
+                        len(token_ids),
+                        skip_leading_tokens,
+                        len(token_ids) - skip_leading_tokens,
+                        _dsa_debug_shape(slot_mapping),
+                    )
 
                 logger.debug(
                     "Storing KV cache for %d out of %d tokens "
@@ -2467,6 +2545,36 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is not None:
                 req_meta.resumed_from_preemption = preempted
+                if is_sparse_decode and _dsa_debug_should_log(
+                    self, "build_connector_meta_sparse"
+                ):
+                    save_spec = req_meta.save_spec
+                    load_spec_dbg = req_meta.load_spec
+                    logger.warning(
+                        "[DSA_META_DBG] build_connector_meta_sparse req=%s "
+                        "in_unfinished=%s num_new_tokens=%s new_block_ids=%s "
+                        "num_current_tokens=%s tracker_len=%s new_token_ids_len=%s "
+                        "token_ids_len=%s load_can_load=%s vllm_cached=%s "
+                        "lmcache_cached=%s save_can_save=%s "
+                        "save_skip_leading=%s resumed=%s",
+                        req_id,
+                        req_id in self._unfinished_requests,
+                        num_new_tokens,
+                        new_block_ids,
+                        num_current_tokens,
+                        tracker_len,
+                        len(new_token_ids),
+                        len(req_meta.token_ids),
+                        load_spec_dbg.can_load if load_spec_dbg is not None else None,
+                        load_spec_dbg.vllm_cached_tokens
+                        if load_spec_dbg is not None else None,
+                        load_spec_dbg.lmcache_cached_tokens
+                        if load_spec_dbg is not None else None,
+                        save_spec.can_save if save_spec is not None else None,
+                        save_spec.skip_leading_tokens
+                        if save_spec is not None else None,
+                        preempted,
+                    )
                 meta.add_request(req_meta)
 
         return meta

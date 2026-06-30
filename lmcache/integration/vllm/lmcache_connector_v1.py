@@ -2,6 +2,7 @@
 
 # Standard
 from typing import TYPE_CHECKING, Any, Optional
+import os
 
 # Third Party
 from vllm.config import VllmConfig
@@ -25,6 +26,15 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _dsa_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_SHRINK_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
@@ -72,7 +82,22 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1):
             the same.
 
         """
+        if _dsa_debug_enabled():
+            attn_metadata = getattr(forward_context, "attn_metadata", None)
+            logger.warning(
+                "[DSA_LOAD_DBG] lmcache_connector_wrapper start_load_enter "
+                "connector=%s attn_metadata=%s kwargs=%s",
+                self.__class__.__name__,
+                attn_metadata.__class__.__name__ if attn_metadata is not None else None,
+                sorted(kwargs.keys()),
+            )
         self._lmcache_engine.start_load_kv(forward_context, **kwargs)
+        if _dsa_debug_enabled():
+            logger.warning(
+                "[DSA_LOAD_DBG] lmcache_connector_wrapper start_load_return "
+                "connector=%s",
+                self.__class__.__name__,
+            )
 
     def wait_for_layer_load(
         self,
