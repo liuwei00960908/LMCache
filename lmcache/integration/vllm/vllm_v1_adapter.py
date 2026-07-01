@@ -33,6 +33,11 @@ from lmcache.integration.vllm.utils import (
     extract_mm_features,
     lmcache_get_or_create_config,
 )
+from lmcache.integration.vllm._retrieve_prof import (
+    begin as _retr_begin,
+    end as _retr_end,
+    step as _retr_step,
+)
 from lmcache.integration.vllm.vllm_service_factory import VllmServiceFactory
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor, PrometheusLogger
@@ -1845,9 +1850,11 @@ class LMCacheConnectorV1Impl:
                         request.load_spec.vllm_cached_tokens,
                         request.load_spec.lmcache_cached_tokens,
                     )
+                _t_send = _retr_begin("retriever_send")
                 ret_token_mask = layerwise_retriever.send(
                     (selected_tokens_per_req, token_start_index_per_req)
                 )
+                _retr_end(_t_send)
                 if _dsa_debug_enabled():
                     logger.warning(
                         "[DSA_SHRINK_CHECK] lmcache_wait_send_sparse_done step=%s "
@@ -1884,6 +1891,7 @@ class LMCacheConnectorV1Impl:
                     len(self.layerwise_retrievers),
                 )
             self.current_layer += 1
+            _retr_step()
             if _dsa_debug_enabled():
                 logger.warning(
                     "[DSA_SHRINK_CHECK] lmcache_wait_layer_advanced step=%s "
