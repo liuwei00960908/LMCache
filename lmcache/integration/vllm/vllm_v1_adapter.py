@@ -1941,37 +1941,34 @@ class LMCacheConnectorV1Impl:
                 if _dsa_retrieve_debug_should_log(
                     self, "lmcache_wait_send_sparse"
                 ):
+                    _selected_zero_count = _dsa_debug_value_count(
+                        selected_tokens_per_req, 0
+                    )
+                    _selected_trailing_zeros = _dsa_debug_trailing_value_count(
+                        selected_tokens_per_req, 0
+                    )
                     logger.warning(
                         "[DSA_RETRIEVE_DEBUG] lmcache_wait_send_sparse "
                         "layer=%s req=%s idx=%s decode_row=%s row=%s "
-                        "selected_shape=%s selected_sample=%s "
-                        "selected_tail=%s selected_zero_count=%s "
-                        "selected_trailing_zeros=%s selected_minmax_count=%s "
+                        "selected_shape=%s selected_zero_count=%s "
+                        "selected_trailing_zeros=%s selected_padding_suspect=%s "
+                        "selected_minmax_count=%s "
                         "token_start_index=%s slot_mapping_shape=%s "
-                        "slot_mapping_sample=%s slot_mapping_tail=%s "
                         "slot_mapping_minmax_count=%s vllm_cached=%s "
-                        "lmcache_cached=%s",
+                        "lmcache_cached=%s will_send_to_retriever=%s",
                         layer_name,
                         request.req_id,
                         idx,
                         decode_row,
                         None if selected_tokens is None else row,
                         _dsa_debug_shape(selected_tokens_per_req),
-                        _dsa_debug_sample(selected_tokens_per_req),
-                        _dsa_debug_tail_sample(selected_tokens_per_req),
-                        _dsa_debug_value_count(selected_tokens_per_req, 0),
-                        _dsa_debug_trailing_value_count(
-                            selected_tokens_per_req, 0
-                        ),
+                        _selected_zero_count,
+                        _selected_trailing_zeros,
+                        isinstance(_selected_trailing_zeros, int)
+                        and _selected_trailing_zeros > 0,
                         _dsa_debug_minmax_count(selected_tokens_per_req),
                         token_start_index_per_req,
                         _dsa_debug_shape(
-                            request.slot_mapping[0] if request.slot_mapping else None
-                        ),
-                        _dsa_debug_sample(
-                            request.slot_mapping[0] if request.slot_mapping else None
-                        ),
-                        _dsa_debug_tail_sample(
                             request.slot_mapping[0] if request.slot_mapping else None
                         ),
                         _dsa_debug_minmax_count(
@@ -1979,6 +1976,7 @@ class LMCacheConnectorV1Impl:
                         ),
                         request.load_spec.vllm_cached_tokens,
                         request.load_spec.lmcache_cached_tokens,
+                        True,
                     )
                 _t_send = _retr_begin("retriever_send")
                 ret_token_mask = layerwise_retriever.send(
