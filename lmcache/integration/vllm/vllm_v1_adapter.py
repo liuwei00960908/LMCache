@@ -89,6 +89,44 @@ def _dsa_debug_limit() -> int:
         return 8
 
 
+def _dsa_retrieve_debug_enabled() -> bool:
+    return os.environ.get("VLLM_ASCEND_DSA_RETRIEVE_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _dsa_retrieve_debug_limit() -> int:
+    try:
+        return max(
+            1,
+            int(
+                os.environ.get(
+                    "VLLM_ASCEND_DSA_RETRIEVE_DEBUG_LIMIT",
+                    str(_dsa_debug_limit()),
+                )
+            ),
+        )
+    except ValueError:
+        return _dsa_debug_limit()
+
+
+def _dsa_retrieve_debug_should_log(owner: Any, site: str) -> bool:
+    if not _dsa_retrieve_debug_enabled():
+        return False
+    counts = getattr(owner, "_dsa_retrieve_debug_counts", None)
+    if counts is None:
+        counts = {}
+        setattr(owner, "_dsa_retrieve_debug_counts", counts)
+    count = counts.get(site, 0)
+    if count >= _dsa_retrieve_debug_limit():
+        return False
+    counts[site] = count + 1
+    return True
+
+
 def _dsa_debug_should_log(owner: Any, site: str) -> bool:
     if not _dsa_debug_enabled():
         return False
@@ -129,6 +167,56 @@ def _dsa_debug_sample(value: Any, limit: Optional[int] = None) -> Any:
         return list(value[:limit])
     except Exception as exc:
         return f"{type(value).__name__}:sample_failed:{exc}"
+
+
+def _dsa_debug_tail_sample(value: Any, limit: Optional[int] = None) -> Any:
+    if value is None:
+        return None
+    limit = _dsa_debug_limit() if limit is None else limit
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return []
+            flat = value.detach().reshape(-1)
+            return flat[-limit:].to(device="cpu").tolist()
+        seq = list(value)
+        return seq[-limit:]
+    except Exception as exc:
+        return f"{type(value).__name__}:tail_sample_failed:{exc}"
+
+
+def _dsa_debug_value_count(value: Any, target: int) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return 0
+            flat = value.detach().reshape(-1)
+            return int((flat == target).sum().to(device="cpu").item())
+        return sum(1 for item in value if item == target)
+    except Exception as exc:
+        return f"{type(value).__name__}:value_count_failed:{exc}"
+
+
+def _dsa_debug_trailing_value_count(value: Any, target: int) -> Any:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return 0
+            seq = value.detach().reshape(-1).to(device="cpu").tolist()
+        else:
+            seq = list(value)
+        count = 0
+        for item in reversed(seq):
+            if item != target:
+                break
+            count += 1
+        return count
+    except Exception as exc:
+        return f"{type(value).__name__}:trailing_count_failed:{exc}"
 
 
 def _dsa_debug_minmax_count(value: Any) -> Any:
@@ -1842,6 +1930,48 @@ class LMCacheConnectorV1Impl:
                             request.slot_mapping[0] if request.slot_mapping else None
                         ),
                         _dsa_debug_sample(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        _dsa_debug_minmax_count(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        request.load_spec.vllm_cached_tokens,
+                        request.load_spec.lmcache_cached_tokens,
+                    )
+                if _dsa_retrieve_debug_should_log(
+                    self, "lmcache_wait_send_sparse"
+                ):
+                    logger.warning(
+                        "[DSA_RETRIEVE_DEBUG] lmcache_wait_send_sparse "
+                        "layer=%s req=%s idx=%s decode_row=%s row=%s "
+                        "selected_shape=%s selected_sample=%s "
+                        "selected_tail=%s selected_zero_count=%s "
+                        "selected_trailing_zeros=%s selected_minmax_count=%s "
+                        "token_start_index=%s slot_mapping_shape=%s "
+                        "slot_mapping_sample=%s slot_mapping_tail=%s "
+                        "slot_mapping_minmax_count=%s vllm_cached=%s "
+                        "lmcache_cached=%s",
+                        layer_name,
+                        request.req_id,
+                        idx,
+                        decode_row,
+                        None if selected_tokens is None else row,
+                        _dsa_debug_shape(selected_tokens_per_req),
+                        _dsa_debug_sample(selected_tokens_per_req),
+                        _dsa_debug_tail_sample(selected_tokens_per_req),
+                        _dsa_debug_value_count(selected_tokens_per_req, 0),
+                        _dsa_debug_trailing_value_count(
+                            selected_tokens_per_req, 0
+                        ),
+                        _dsa_debug_minmax_count(selected_tokens_per_req),
+                        token_start_index_per_req,
+                        _dsa_debug_shape(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        _dsa_debug_sample(
+                            request.slot_mapping[0] if request.slot_mapping else None
+                        ),
+                        _dsa_debug_tail_sample(
                             request.slot_mapping[0] if request.slot_mapping else None
                         ),
                         _dsa_debug_minmax_count(
