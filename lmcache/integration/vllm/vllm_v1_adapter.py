@@ -1987,6 +1987,11 @@ class LMCacheConnectorV1Impl:
                 if is_first:
                     is_first = False
 
+            if self._is_decode_window_save_request(request):
+                logger.warning(
+                    "[DBG_SAVE_KV] next() on decode-window storer key=%s",
+                    self._layerwise_save_storer_key(request),
+                )
             next(layerwise_storer)
 
     @_lmcache_nvtx_annotate
@@ -2014,8 +2019,32 @@ class LMCacheConnectorV1Impl:
                     self._layerwise_save_storer_key(request), None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    if self._is_decode_window_save_request(request):
+                        logger.warning(
+                            "[DBG_WAIT_SAVE] storer FOUND key=%s, "
+                            "calling next()",
+                            self._layerwise_save_storer_key(request),
+                        )
+                        try:
+                            next(layerwise_storer)
+                        except Exception as e:
+                            logger.error(
+                                "[DBG_WAIT_SAVE] next() FAILED key=%s "
+                                "error=%s",
+                                self._layerwise_save_storer_key(request),
+                                e,
+                            )
+                            raise
+                    else:
+                        next(layerwise_storer)
                     self._mark_decode_window_save_completed(request)
+                elif self._is_decode_window_save_request(request):
+                    logger.warning(
+                        "[DBG_WAIT_SAVE] storer=None! key=%s "
+                        "dict_keys=%s",
+                        self._layerwise_save_storer_key(request),
+                        list(self._layerwise_save_storers.keys()),
+                    )
                 self._maybe_lookup_unpin_for_request(request)
             return
 
