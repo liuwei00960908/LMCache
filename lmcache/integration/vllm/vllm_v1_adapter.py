@@ -59,6 +59,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
+
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
 )
@@ -1755,6 +1757,33 @@ class LMCacheConnectorV1Impl:
     def _num_layers_for_group(self, kv_group: int) -> int:
         return len(self._kvcaches_for_group(kv_group))
 
+    @staticmethod
+    def _min_layer_cache_chunks(
+        layer_cache: Optional[list], num_layers: int
+    ) -> int:
+        """Return the minimum chunk count across layers for diagnostics.
+
+        Returns 0 if any expected layer is missing or empty, so the
+        caller can treat 0 as 'not fully covered'.
+        """
+        if not layer_cache:
+            return 0
+        if num_layers > 0 and len(layer_cache) < num_layers:
+            return 0
+        counts: list[int] = []
+        for entry in layer_cache:
+            if entry is None:
+                counts.append(0)
+            elif isinstance(entry, list):
+                counts.append(len(entry))
+            elif hasattr(entry, "shape") and entry.shape:
+                counts.append(int(entry.shape[0]))
+            elif hasattr(entry, "__len__"):
+                counts.append(len(entry))
+            else:
+                counts.append(0)
+        return min(counts) if counts else 0
+
     def _is_dsa_two_groups(self) -> bool:
         return bool(getattr(getattr(self, "config", None), "dsa_two_groups", False))
 
@@ -2886,13 +2915,23 @@ class LMCacheConnectorV1Impl:
             )
             return
         if not self._decode_window_save_store_cache_ready(request):
-            logger.debug(
-                "Decode-window save not marked complete before shared CPU "
-                "store cache has per-layer pointer coverage: req_id=%s "
-                "required_groups=%s",
-                request.req_id,
-                sorted(self._decode_window_save_required_groups(request)),
-            )
+            if _DSA_PROF:
+                required = self._decode_window_save_required_groups(request)
+                cache_kwargs = _retrieve_cache_kwargs(
+                    request,
+                    kv_group=0,
+                    dsa_two_groups=self._is_dsa_two_groups(),
+                )
+                print(
+                    f"[DECODE_WINDOW_READY] req={request.req_id} "
+                    f"ready=False "
+                    f"window_start={getattr(request, 'decode_window_start', None)} "
+                    f"window_end={getattr(request, 'decode_window_end', None)} "
+                    f"required_groups={sorted(required)} "
+                    f"min_mem_chunks={self._min_layer_cache_chunks(cache_kwargs.get('cached_memory_objs'), self._num_layers_for_group(0))} "
+                    f"min_ptr_chunks={self._min_layer_cache_chunks(cache_kwargs.get('cached_chunk_ptrs_npu'), self._num_layers_for_group(0))}",
+                    flush=True,
+                )
             return
         window_end = request.decode_window_end
         if window_end is None:
@@ -2906,6 +2945,21 @@ class LMCacheConnectorV1Impl:
             expected[request.req_id] = max(
                 int(expected.get(request.req_id, 0)),
                 int(window_end),
+            )
+        if _DSA_PROF:
+            cache_kwargs = _retrieve_cache_kwargs(
+                request,
+                kv_group=0,
+                dsa_two_groups=self._is_dsa_two_groups(),
+            )
+            print(
+                f"[DECODE_WINDOW_READY] req={request.req_id} "
+                f"ready=True "
+                f"window_start={getattr(request, 'decode_window_start', None)} "
+                f"window_end={window_end} "
+                f"min_mem_chunks={self._min_layer_cache_chunks(cache_kwargs.get('cached_memory_objs'), self._num_layers_for_group(0))} "
+                f"min_ptr_chunks={self._min_layer_cache_chunks(cache_kwargs.get('cached_chunk_ptrs_npu'), self._num_layers_for_group(0))}",
+                flush=True,
             )
         self._clear_decode_window_save_groups_for_window(request)
 
@@ -3661,6 +3715,12 @@ class LMCacheConnectorV1Impl:
         self, request: ReqMeta, token_count: int
     ) -> bool:
         if request.resumed_from_preemption:
+            if _DSA_PROF:
+                print(
+                    f"[WORKER_RETRIEVE_STATE] req={request.req_id} "
+                    f"event=invalidate reason=preemption",
+                    flush=True,
+                )
             return True
         state = self._worker_retrieve_state.get(request.req_id)
         if state is None:
@@ -3677,13 +3737,36 @@ class LMCacheConnectorV1Impl:
                     token_count,
                 )
                 if state.request_scope_token != expected_scope_token:
+                    if _DSA_PROF:
+                        print(
+                            f"[WORKER_RETRIEVE_STATE] req={request.req_id} "
+                            f"event=invalidate reason=scope_mismatch "
+                            f"load_cached={request.load_spec.lmcache_cached_tokens if request.load_spec else None} "
+                            f"state_token_count={state.token_count} "
+                            f"token_count={token_count}",
+                            flush=True,
+                        )
                     return True
             if state.cached_starts and state.cached_starts[0] != 0:
+                if _DSA_PROF:
+                    print(
+                        f"[WORKER_RETRIEVE_STATE] req={request.req_id} "
+                        f"event=invalidate reason=cached_starts_nonzero",
+                        flush=True,
+                    )
                 return True
             if (
                 request.load_spec is not None
                 and request.load_spec.lmcache_cached_tokens > state.token_count
             ):
+                if _DSA_PROF:
+                    print(
+                        f"[WORKER_RETRIEVE_STATE] req={request.req_id} "
+                        f"event=invalidate reason=cached_grew "
+                        f"load_cached={request.load_spec.lmcache_cached_tokens} "
+                        f"state_token_count={state.token_count}",
+                        flush=True,
+                    )
                 return True
             # Sparse decode metadata is keyed by the full LMCache-hit prefix.
             # A shorter current prefix means the cached request state is stale.
@@ -3691,7 +3774,25 @@ class LMCacheConnectorV1Impl:
                 token_count < state.token_count
                 or len(request.token_ids) < state.token_count
             ):
+                if _DSA_PROF:
+                    print(
+                        f"[WORKER_RETRIEVE_STATE] req={request.req_id} "
+                        f"event=invalidate reason=prefix_shrunk "
+                        f"token_count={token_count} "
+                        f"state_token_count={state.token_count}",
+                        flush=True,
+                    )
                 return True
+            if _DSA_PROF:
+                print(
+                    f"[WORKER_RETRIEVE_STATE] req={request.req_id} "
+                    f"event=reuse reason=ok "
+                    f"load_cached={request.load_spec.lmcache_cached_tokens if request.load_spec else None} "
+                    f"state_token_count={state.token_count} "
+                    f"token_count={token_count} "
+                    f"shared_active={state.shared_request_active}",
+                    flush=True,
+                )
             return False
         if state.cached_ends and token_count < state.cached_ends[-1]:
             return True
@@ -6469,6 +6570,16 @@ class LMCacheConnectorV1Impl:
                         save_frontier,
                         token_len,
                     )
+                    if _DSA_PROF:
+                        print(
+                            f"[SPARSE_BOUNDARY] req={req_id} "
+                            f"prompt_len={request_tracker.prompt_len} "
+                            f"token_len={token_len} "
+                            f"committed_end={request_tracker.decode_window_save_committed_end} "
+                            f"save_frontier={save_frontier} "
+                            f"lmcache_cached_for_sparse={lmcache_cached_for_sparse}",
+                            flush=True,
+                        )
                 load_spec = LoadSpec(
                     vllm_cached_tokens=0,
                     lmcache_cached_tokens=lmcache_cached_for_sparse,
