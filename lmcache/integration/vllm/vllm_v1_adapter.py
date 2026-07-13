@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -60,6 +61,40 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _DSA_PROF = os.getenv("VLLM_ASCEND_DSA_PROF", "0") == "1"
+_DSA_PROF_LAYERS = int(os.getenv("VLLM_ASCEND_DSA_PROF_LAYERS", "61"))
+_lmc_retrieve_prof_acc: dict[str, float] = {}
+_lmc_retrieve_prof_count = 0
+
+
+def _lmc_retrieve_prof_begin() -> float:
+    if not _DSA_PROF:
+        return 0.0
+    return time.perf_counter()
+
+
+def _lmc_retrieve_prof_add(name: str, start: float) -> None:
+    if not _DSA_PROF or start == 0.0:
+        return
+    _lmc_retrieve_prof_acc[name] = _lmc_retrieve_prof_acc.get(name, 0.0) + (
+        time.perf_counter() - start
+    ) * 1000.0
+
+
+def _lmc_retrieve_prof_step() -> None:
+    if not _DSA_PROF:
+        return
+    global _lmc_retrieve_prof_count, _lmc_retrieve_prof_acc
+    _lmc_retrieve_prof_count += 1
+    if _lmc_retrieve_prof_count < _DSA_PROF_LAYERS:
+        return
+    parts = [f"{key}={value:.2f}ms" for key, value in _lmc_retrieve_prof_acc.items()]
+    print(
+        f"[LMC_RETRIEVE_PROF] calls={_lmc_retrieve_prof_count} "
+        + " ".join(parts),
+        flush=True,
+    )
+    _lmc_retrieve_prof_count = 0
+    _lmc_retrieve_prof_acc = {}
 
 SPARSE_DECODE_RETRIEVE_TOKENS = int(
     os.environ.get("LMCACHE_SPARSE_DECODE_RETRIEVE_TOKENS", "2048")
@@ -5093,6 +5128,8 @@ class LMCacheConnectorV1Impl:
         if not self.layerwise_retrievers:
             return
 
+        _prof_total = _lmc_retrieve_prof_begin()
+        _prof_start = _lmc_retrieve_prof_begin()
         metadata: Optional[LMCacheConnectorMetadata] = None
 
         layerwise_requests = getattr(self, "_layerwise_requests", None)
@@ -5127,12 +5164,15 @@ class LMCacheConnectorV1Impl:
                 rows_of_req = {}
                 for row, rid in enumerate(request_ids):
                     rows_of_req.setdefault(rid, []).append(row)
+        _lmc_retrieve_prof_add("metadata", _prof_start)
 
         selected_rows = None
         if selected_tokens is not None:
             # After this wait, row selection and connector-side packing are
             # ordered by the current stream; the load stream later waits on it.
+            _prof_start = _lmc_retrieve_prof_begin()
             _dsa_wait_payload_event(payload_event)
+            _lmc_retrieve_prof_add("payload_wait", _prof_start)
             selected_rows = (
                 int(selected_tokens.shape[0])
                 if hasattr(selected_tokens, "shape")
@@ -5159,6 +5199,7 @@ class LMCacheConnectorV1Impl:
                 break
             layerwise_retriever, indexer_retriever = self.layerwise_retrievers[idx]
             if request.is_sparse_decode:
+                _prof_start = _lmc_retrieve_prof_begin()
                 payload = None
                 rows = None
                 row_count = 1
@@ -5269,6 +5310,7 @@ class LMCacheConnectorV1Impl:
                     if payload is not None
                     else (selected_tokens_per_req, token_start_index_per_req)
                 )
+                _lmc_retrieve_prof_add("payload_build", _prof_start)
                 indexer_sent_key = (
                     (request.req_id, self.current_layer)
                     if indexer_retriever is not None
@@ -5302,27 +5344,35 @@ class LMCacheConnectorV1Impl:
                         )
                         and indexer_sent_key not in sparse_indexer_sent_layers
                     ):
+                        _prof_start = _lmc_retrieve_prof_begin()
                         indexer_retriever.send((None, 0))
+                        _lmc_retrieve_prof_add("send_indexer", _prof_start)
                         sparse_indexer_sent_layers.add(indexer_sent_key)
                 else:
+                    _prof_start = _lmc_retrieve_prof_begin()
                     ret_token_mask = layerwise_retriever.send(sparse_payload)
+                    _lmc_retrieve_prof_add("send_latent", _prof_start)
                     if (
                         indexer_retriever is not None
                         and sparse_indexer_sent_layers is not None
                         and indexer_sent_key not in sparse_indexer_sent_layers
                     ):
+                        _prof_start = _lmc_retrieve_prof_begin()
                         indexer_ret_mask = indexer_retriever.send((None, 0))
+                        _lmc_retrieve_prof_add("send_indexer", _prof_start)
                         sparse_indexer_sent_layers.add(indexer_sent_key)
                         if ret_token_mask is None:
                             ret_token_mask = indexer_ret_mask
                 decode_row += row_count
             else:
+                _prof_start = _lmc_retrieve_prof_begin()
                 if wait_group == 1:
                     if indexer_retriever is not None:
                         next(indexer_retriever)
                     ret_token_mask = None
                 else:
                     ret_token_mask = next(layerwise_retriever)
+                _lmc_retrieve_prof_add("dense_next", _prof_start)
 
             if (
                 wait_group == 0
@@ -5337,12 +5387,16 @@ class LMCacheConnectorV1Impl:
         if self.layerwise_retrievers and self._layerwise_wait_should_advance(wait_group):
             self.current_layer += 1
             if self.current_layer >= self.num_layers:
+                _prof_start = _lmc_retrieve_prof_begin()
                 if metadata is None:
                     metadata = self._parent._get_connector_metadata()
                     assert isinstance(metadata, LMCacheConnectorMetadata)
                 self._finalize_worker_retrieve_state_from_metadata(metadata)
                 self._drain_layerwise_retrievers()
+                _lmc_retrieve_prof_add("state_finalize", _prof_start)
 
+        _lmc_retrieve_prof_add("total", _prof_total)
+        _lmc_retrieve_prof_step()
         return
 
     def _should_defer_latent_save_under_tp(self) -> bool:
