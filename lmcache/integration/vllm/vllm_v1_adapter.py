@@ -1287,6 +1287,9 @@ class LMCacheConnectorV1Impl:
         self._layerwise_waited_groups: set[int] = set()
         self._layerwise_sparse_indexer_sent_layers: set[tuple[str, int]] = set()
         self._layerwise_required_wait_groups_cache: Optional[set[int]] = None
+        self._prepared_sparse_batch_handle: Optional[Any] = None
+        self._prepared_sparse_batch_requests: list[ReqMeta] = []
+        self._prepared_sparse_batch_groups: dict[int, list[dict[str, Any]]] = {}
         self._layerwise_save_storers: dict[
             LayerwiseSaveKey, Generator[Optional[LayerwiseStoreResult], None, None]
         ] = {}
@@ -2496,6 +2499,17 @@ class LMCacheConnectorV1Impl:
             if hasattr(self, "_layerwise_sparse_indexer_sent_layers"):
                 self._layerwise_sparse_indexer_sent_layers.clear()
             self._layerwise_required_wait_groups_cache = None
+            self._close_prepared_sparse_batch()
+
+    def _close_prepared_sparse_batch(self) -> None:
+        handle = getattr(self, "_prepared_sparse_batch_handle", None)
+        self._prepared_sparse_batch_handle = None
+        if hasattr(self, "_prepared_sparse_batch_requests"):
+            self._prepared_sparse_batch_requests.clear()
+        if hasattr(self, "_prepared_sparse_batch_groups"):
+            self._prepared_sparse_batch_groups.clear()
+        if handle is not None:
+            self.lmcache_engine.close_sparse_retrieve_batch(handle)
 
     @staticmethod
     def _close_layerwise_retriever(
@@ -4287,6 +4301,119 @@ class LMCacheConnectorV1Impl:
             retrieve_kwargs["ret_mask"] = request.decode_ret_mask
         return retrieve_kwargs, shared_cpu_preflight_state, prepared_source
 
+    def _try_prepare_sparse_retrieve_batch(
+        self,
+        loadable_requests: list[tuple[int, ReqMeta]],
+        kvcaches: list[torch.Tensor],
+    ) -> bool:
+        engine = self.lmcache_engine
+        capabilities = (
+            "prepare_sparse_retrieve_batch",
+            "retrieve_prepared_sparse_batch_layer",
+            "close_sparse_retrieve_batch",
+        )
+        if not loadable_requests or not all(
+            callable(getattr(engine, name, None)) for name in capabilities
+        ):
+            return False
+        if self.enable_blending:
+            return False
+        if any(
+            not request.is_sparse_decode or request.load_spec is None
+            for _, request in loadable_requests
+        ):
+            return False
+
+        shared_cpu_enabled = bool(
+            getattr(engine, "enable_shared_cpu_cache", False)
+        )
+        requests: list[ReqMeta] = []
+        items: list[dict[str, Any]] = []
+        for _, request in loadable_requests:
+            assert request.load_spec is not None
+            token_count = int(request.load_spec.lmcache_cached_tokens)
+            if self._should_invalidate_worker_retrieve_state(request, token_count):
+                self._drop_worker_retrieve_state(request.req_id)
+            state = self._worker_retrieve_state_for_request(request)
+            prepared_source = self._prepared_sparse_source(state, 0, token_count)
+            if prepared_source is None:
+                return False
+            chunk_counts = prepared_source.chunk_token_counts
+            if (
+                not chunk_counts
+                and prepared_source.layers
+                and len(prepared_source.layers[0].tensors) > 1
+            ):
+                return False
+            if chunk_counts:
+                expected_last = token_count - (
+                    len(chunk_counts) - 1
+                ) * self._lmcache_chunk_size
+                if (
+                    expected_last <= 0
+                    or any(
+                        count != self._lmcache_chunk_size
+                        for count in chunk_counts[:-1]
+                    )
+                    or chunk_counts[-1] != expected_last
+                ):
+                    return False
+
+            if self._sparse_decode_requires_index_materialization(
+                request, shared_cpu_enabled
+            ) and not (
+                shared_cpu_enabled
+                and self._shared_sparse_decode_indexer_is_resident(
+                    request, state, token_count
+                )
+            ):
+                return False
+
+            assert request.slot_mapping
+            slot_mapping = request.slot_mapping[0]
+            if slot_mapping.device != torch.device(
+                self.device
+            ) or slot_mapping.dtype != torch.long:
+                slot_mapping = slot_mapping.to(device=self.device, dtype=torch.long)
+                request.slot_mapping[0] = slot_mapping
+            requests.append(request)
+            items.append(
+                {
+                    "req_id": request.req_id,
+                    "prepared_sparse_source": prepared_source,
+                    "kvcaches": kvcaches,
+                    "slot_mapping": slot_mapping,
+                }
+            )
+
+        groups = {0: items}
+        handle = None
+        try:
+            handle = engine.prepare_sparse_retrieve_batch(groups)
+            if handle is None:
+                raise ValueError("Prepared sparse batch returned no handle")
+            self._prepared_sparse_batch_requests = requests
+            self._prepared_sparse_batch_groups = groups
+            self._prepared_sparse_batch_handle = handle
+        except ValueError as error:
+            if handle is not None:
+                engine.close_sparse_retrieve_batch(handle)
+            self._prepared_sparse_batch_handle = None
+            self._prepared_sparse_batch_requests.clear()
+            self._prepared_sparse_batch_groups.clear()
+            logger.debug("Prepared sparse batch is unsupported: %s", error)
+            return False
+        except BaseException:
+            self._prepared_sparse_batch_handle = None
+            if hasattr(self, "_prepared_sparse_batch_requests"):
+                self._prepared_sparse_batch_requests.clear()
+            if hasattr(self, "_prepared_sparse_batch_groups"):
+                self._prepared_sparse_batch_groups.clear()
+            if handle is not None:
+                engine.close_sparse_retrieve_batch(handle)
+            raise
+        return True
+
     @staticmethod
     def _prime_dense_prefix_retrievers(
         layerwise_retriever: Generator[Optional[torch.Tensor], None, None],
@@ -4340,6 +4467,7 @@ class LMCacheConnectorV1Impl:
         """
         self.current_layer = 0
         self._wait_for_save_done = False
+        self._drain_layerwise_retrievers()
 
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
@@ -4386,7 +4514,6 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
-        self._drain_layerwise_retrievers()
         gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
         if staged_load_count and gpu_connector is not None and hasattr(
             gpu_connector, "set_layerwise_staging_concurrency"
@@ -4399,6 +4526,9 @@ class LMCacheConnectorV1Impl:
         if has_load_spec:
             self._stats_monitor.update_interval_vllm_hit_tokens(vllm_hit_tokens)
             self._stats_monitor.update_interval_prompt_tokens(prompt_tokens)
+
+        if self._try_prepare_sparse_retrieve_batch(loadable_requests, kvcaches):
+            return
 
         for load_idx, (idx, request) in enumerate(loadable_requests):
             tokens = request.token_ids
@@ -4965,10 +5095,59 @@ class LMCacheConnectorV1Impl:
                 selected_tokens/target_slot_mapping were built. LMCache waits on
                 this before row-selecting from those tensors.
         """
-        if self.layerwise_retrievers and logger.isEnabledFor(10):
+        prepared_batch_active = (
+            getattr(self, "_prepared_sparse_batch_handle", None) is not None
+        )
+        if (self.layerwise_retrievers or prepared_batch_active) and logger.isEnabledFor(
+            10
+        ):
             logger.debug("Waiting for layer %d to be loaded", self.current_layer)
 
-        if not self.layerwise_retrievers:
+        if not self.layerwise_retrievers and not prepared_batch_active:
+            return
+
+        if prepared_batch_active:
+            requests = tuple(self._prepared_sparse_batch_requests)
+            wait_group = self._layerwise_wait_group(layer_name)
+            if wait_group == 1:
+                return
+            with self._sparse_retrieve_state_guard(requests):
+                if (
+                    not isinstance(selected_tokens, torch.Tensor)
+                    or selected_tokens.ndim != 2
+                ):
+                    raise RuntimeError(
+                        "Prepared sparse batch requires rank-2 selected_tokens"
+                    )
+                if (
+                    request_ids is None
+                    or len(request_ids) != selected_tokens.shape[0]
+                ):
+                    raise RuntimeError(
+                        "Prepared sparse batch requires row-aligned request_ids"
+                    )
+                if target_slot_mapping is None and token_start_index is not None:
+                    raise RuntimeError(
+                        "Prepared sparse batch requires explicit target slots when "
+                        "token_start_index is provided"
+                    )
+                self.lmcache_engine.retrieve_prepared_sparse_batch_layer(
+                    self._prepared_sparse_batch_handle,
+                    0,
+                    self.current_layer,
+                    selected_tokens,
+                    target_slot_mapping,
+                    request_ids,
+                    payload_event=payload_event,
+                )
+            if self._layerwise_wait_should_advance(wait_group):
+                self.current_layer += 1
+                if self.current_layer >= self.num_layers:
+                    with self._sparse_retrieve_state_guard(requests):
+                        metadata = self._parent._get_connector_metadata()
+                        assert isinstance(metadata, LMCacheConnectorMetadata)
+                        self._finalize_worker_retrieve_state_from_metadata(metadata)
+                        self._drain_layerwise_retrievers()
             return
 
         metadata: Optional[LMCacheConnectorMetadata] = None
@@ -6031,6 +6210,7 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        self._drain_layerwise_retrievers(finish_dense=False)
         self._manager.stop_services()
 
     ###################

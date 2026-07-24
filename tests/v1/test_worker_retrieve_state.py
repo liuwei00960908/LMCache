@@ -124,6 +124,107 @@ def _bind_worker_state(impl: LMCacheConnectorV1Impl, request: ReqMeta):
     return impl._worker_retrieve_state_for_request(request)
 
 
+def _make_prepared_batch_connector(
+    requests: list[ReqMeta],
+    *,
+    num_layers: int = 2,
+    dsa_two_groups: bool = False,
+    kv_role: str = "kv_both",
+):
+    class _BatchEngine:
+        enable_shared_cpu_cache = False
+
+        def __init__(self):
+            self.handle = object()
+            self.prepare_calls = []
+            self.retrieve_calls = []
+            self.close_calls = []
+            self.generator_calls = []
+            self.unpinned = []
+
+        def lookup_unpin(self, req_id):
+            self.unpinned.append(req_id)
+
+        def prepare_sparse_retrieve_batch(self, groups):
+            self.prepare_calls.append(groups)
+            return self.handle
+
+        def retrieve_prepared_sparse_batch_layer(self, *args, **kwargs):
+            self.retrieve_calls.append((args, kwargs))
+
+        def close_sparse_retrieve_batch(self, handle):
+            self.close_calls.append(handle)
+
+        def retrieve_layer_head_token_wise(self, tokens, mask, **kwargs):
+            self.generator_calls.append(("sparse", kwargs.get("kv_group")))
+
+            def _retriever():
+                yield None
+                while True:
+                    yield torch.ones(len(tokens), dtype=torch.bool)
+
+            return _retriever()
+
+        def retrieve_layer(self, tokens, mask, **kwargs):
+            self.generator_calls.append(("dense", kwargs["kv_group"]))
+
+            def _retriever():
+                yield None
+                yield None
+                while True:
+                    yield torch.ones(len(tokens), dtype=torch.bool)
+
+            return _retriever()
+
+    engine = _BatchEngine()
+    impl, _, _ = make_worker_connector(
+        requests,
+        engine=engine,
+        use_layerwise=True,
+        kv_role=kv_role,
+    )
+    impl.config.dsa_two_groups = dsa_two_groups
+    impl.num_layers = num_layers
+    impl.kv_caches = {
+        **{
+            f"model.layers.{layer}.self_attn.attn.k_cache": torch.zeros(1)
+            for layer in range(num_layers)
+        },
+        **(
+            {
+                f"model.layers.{layer}.self_attn.indexer.k_cache": torch.zeros(1)
+                for layer in range(num_layers)
+            }
+            if dsa_two_groups
+            else {}
+        ),
+    }
+    impl._refresh_kvcaches_list()
+    impl.layerwise_retrievers = []
+    impl._layerwise_requests = []
+    impl._layerwise_retriever_is_sparse = []
+    impl._layerwise_sparse_req_ids = []
+    impl._stats_monitor = SimpleNamespace(
+        update_interval_vllm_hit_tokens=MagicMock(),
+        update_interval_prompt_tokens=MagicMock(),
+    )
+    for request in requests:
+        if not request.is_sparse_decode or request.load_spec is None:
+            continue
+        token_count = request.load_spec.lmcache_cached_tokens
+        impl._worker_retrieve_state[request.req_id] = WorkerRetrieveState(
+            req_id=request.req_id,
+            metadata_warm=True,
+            token_count=token_count,
+            prepared_sparse_sources={
+                0: adapter_mod.PreparedSparseSource(
+                    layers=(), total_tokens=token_count
+                )
+            },
+        )
+    return impl, engine
+
+
 class TestWorkerRetrieveState:
 
     def test_failed_block_reporting_ignores_unmapped_tokens(self):
@@ -2457,6 +2558,160 @@ class TestWorkerRetrieveState:
         assert not hasattr(req, "cached_keys")
         assert impl._worker_retrieve_state[req.req_id] is state
         impl._drain_layerwise_retrievers()
+
+    def test_prepared_sparse_batch_dispatches_original_payload_once(
+        self, monkeypatch
+    ):
+        requests = [
+            make_sparse_req_meta(req_id, token_count=4)
+            for req_id in ("req-0", "req-1")
+        ]
+        impl, engine = _make_prepared_batch_connector(requests)
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert len(engine.prepare_calls) == 1
+        assert [item["req_id"] for item in engine.prepare_calls[0][0]] == [
+            "req-0",
+            "req-1",
+        ]
+        assert engine.generator_calls == []
+        assert impl.layerwise_retrievers == []
+
+        selected_tokens = torch.tensor(
+            [[10, 11], [20, 21], [30, 31]], dtype=torch.int32
+        )
+        target_slot_mapping = torch.tensor(
+            [[100, 101], [200, 201], [300, 301]], dtype=torch.long
+        )
+        request_ids = ["req-1", "req-0", "req-1"]
+        payload_event = object()
+
+        def fail_event_wait(_event):
+            raise AssertionError(
+                "prepared batch must forward the event without waiting"
+            )
+
+        monkeypatch.setattr(
+            adapter_mod,
+            "_dsa_wait_payload_event",
+            fail_event_wait,
+        )
+        impl.wait_for_layer_load(
+            "model.layers.0.self_attn.attn",
+            selected_tokens=selected_tokens,
+            target_slot_mapping=target_slot_mapping,
+            request_ids=request_ids,
+            payload_event=payload_event,
+        )
+
+        assert len(engine.retrieve_calls) == 1
+        args, kwargs = engine.retrieve_calls[0]
+        assert args[:3] == (engine.handle, 0, 0)
+        assert args[3] is selected_tokens
+        assert args[4] is target_slot_mapping
+        assert args[5] is request_ids
+        assert kwargs == {"payload_event": payload_event}
+        assert impl.current_layer == 1
+        assert engine.close_calls == []
+
+    def test_prepared_sparse_batch_closes_after_final_layer(self):
+        requests = [make_sparse_req_meta("req-0", token_count=4)]
+        impl, engine = _make_prepared_batch_connector(requests, num_layers=2)
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+        selected_tokens = torch.tensor([[10, 11]], dtype=torch.int32)
+        target_slot_mapping = torch.tensor([[100, 101]], dtype=torch.long)
+
+        for layer in range(2):
+            impl.wait_for_layer_load(
+                f"model.layers.{layer}.self_attn.attn",
+                selected_tokens=selected_tokens,
+                target_slot_mapping=target_slot_mapping,
+                request_ids=["req-0"],
+            )
+
+        assert [call[0][2] for call in engine.retrieve_calls] == [0, 1]
+        assert engine.close_calls == [engine.handle]
+        assert impl._prepared_sparse_batch_handle is None
+        impl._drain_layerwise_retrievers()
+        assert engine.close_calls == [engine.handle]
+
+    @pytest.mark.parametrize("batch_kind", ["cold", "mixed", "dense", "index"])
+    def test_prepared_sparse_batch_falls_back_to_generators(self, batch_kind):
+        sparse = make_sparse_req_meta("sparse", token_count=4)
+        requests = [sparse]
+        dsa_two_groups = batch_kind == "index"
+        kv_role = "kv_consumer" if dsa_two_groups else "kv_both"
+        if batch_kind == "cold":
+            pass
+        elif batch_kind == "mixed":
+            dense = make_sparse_req_meta("dense", token_count=4)
+            dense.is_sparse_decode = False
+            requests.append(dense)
+        elif batch_kind == "dense":
+            sparse.is_sparse_decode = False
+        elif batch_kind == "index":
+            sparse.indexer_slot_mapping = [torch.arange(4, dtype=torch.long)]
+
+        impl, engine = _make_prepared_batch_connector(
+            requests,
+            num_layers=1,
+            dsa_two_groups=dsa_two_groups,
+            kv_role=kv_role,
+        )
+        if batch_kind == "cold":
+            impl._worker_retrieve_state.clear()
+
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert engine.prepare_calls == []
+        assert engine.generator_calls
+        assert impl.layerwise_retrievers
+        impl._drain_layerwise_retrievers()
+
+    def test_prepared_sparse_batch_dispatch_failure_closes_handle(self):
+        request = make_sparse_req_meta("req-0", token_count=4)
+        impl, engine = _make_prepared_batch_connector([request], num_layers=1)
+        impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+        engine.retrieve_prepared_sparse_batch_layer = MagicMock(
+            side_effect=RuntimeError("batch dispatch failed")
+        )
+
+        with pytest.raises(RuntimeError, match="batch dispatch failed"):
+            impl.wait_for_layer_load(
+                "model.layers.0.self_attn.attn",
+                selected_tokens=torch.tensor([[10, 11]], dtype=torch.int32),
+                target_slot_mapping=torch.tensor([[100, 101]], dtype=torch.long),
+                request_ids=["req-0"],
+            )
+
+        assert engine.close_calls == [engine.handle]
+        assert impl._prepared_sparse_batch_handle is None
+        assert impl._prepared_sparse_batch_requests == []
+        assert impl._prepared_sparse_batch_groups == {}
+
+    def test_prepared_sparse_batch_setup_failure_closes_new_handle(
+        self, monkeypatch
+    ):
+        request = make_sparse_req_meta("req-0", token_count=4)
+        impl, engine = _make_prepared_batch_connector([request], num_layers=1)
+
+        def fail_groups_setup(_self, _groups):
+            raise RuntimeError("batch state setup failed")
+
+        monkeypatch.setattr(
+            LMCacheConnectorV1Impl,
+            "_prepared_sparse_batch_groups",
+            property(lambda _self: {}, fail_groups_setup),
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="batch state setup failed"):
+            impl.start_load_kv(SimpleNamespace(attn_metadata=SimpleNamespace()))
+
+        assert engine.close_calls == [engine.handle]
+        assert impl._prepared_sparse_batch_handle is None
+        assert impl._prepared_sparse_batch_requests == []
 
     def test_start_load_kv_aggregates_step_setup(self):
         sparse = make_sparse_req_meta("sparse", token_count=4)
